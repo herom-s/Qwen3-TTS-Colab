@@ -60,6 +60,7 @@ def get_model(model_type: str, model_size: str):
     global loaded_models
     key = (model_type, model_size)
     if key in loaded_models:
+        print(f"✅ Using cached model: {model_type} {model_size}")
         return loaded_models[key]
     
     clear_other_models(keep_key=key)
@@ -71,13 +72,38 @@ def get_model(model_type: str, model_size: str):
     if not use_cuda:
         print("⚠️ CUDA is not available. Falling back to CPU mode (this will be much slower).")
 
-    model = Qwen3TTSModel.from_pretrained(
-        model_path,
-        device_map=device_map,
-        dtype=dtype,
-    )
-    loaded_models[key] = model
-    return model
+    try:
+        model = Qwen3TTSModel.from_pretrained(
+            model_path,
+            device_map=device_map,
+            dtype=dtype,
+        )
+        loaded_models[key] = model
+        print(f"✅ Using model: {model_type} {model_size}")
+        return model
+    except Exception as e:
+        # If 1.7B cannot be loaded (OOM or runtime limits), fall back to 0.6B.
+        if model_size != "1.7B":
+            raise
+
+        print(f"⚠️ Failed to load {model_type} 1.7B ({e}). Falling back to 0.6B.")
+        fallback_key = (model_type, "0.6B")
+        if fallback_key in loaded_models:
+            loaded_models[key] = loaded_models[fallback_key]
+            print(f"✅ Using cached model: {model_type} 0.6B")
+            return loaded_models[fallback_key]
+
+        clear_other_models(keep_key=fallback_key)
+        fallback_model_path = get_model_path(model_type, "0.6B")
+        fallback_model = Qwen3TTSModel.from_pretrained(
+            fallback_model_path,
+            device_map=device_map,
+            dtype=dtype,
+        )
+        loaded_models[fallback_key] = fallback_model
+        loaded_models[key] = fallback_model
+        print(f"✅ Using model: {model_type} 0.6B")
+        return fallback_model
 
 def _normalize_audio(wav, eps=1e-12, clip=True):
     """Normalize audio to float32 in [-1, 1] range."""
