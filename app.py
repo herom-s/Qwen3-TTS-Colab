@@ -146,8 +146,12 @@ def transcribe_reference(audio_path, mode_input, language="English"):
 def remove_silence_function(file_path, minimum_silence=100):
     """Removes silence from an audio file using Pydub."""
     try:
-        output_path = file_path.replace(".wav", "_no_silence.wav")
-        sound = AudioSegment.from_wav(file_path)
+        base, ext = os.path.splitext(file_path)
+        ext = ext.lower().lstrip(".")
+        out_ext = ext if ext in ("wav", "mp3") else "wav"
+        output_path = f"{base}_no_silence.{out_ext}"
+
+        sound = AudioSegment.from_file(file_path)
         audio_chunks = split_on_silence(sound,
                                         min_silence_len=minimum_silence,
                                         silence_thresh=-45,
@@ -155,7 +159,7 @@ def remove_silence_function(file_path, minimum_silence=100):
         combined = AudioSegment.empty()
         for chunk in audio_chunks:
             combined += chunk
-        combined.export(output_path, format="wav")
+        combined.export(output_path, format=out_ext)
         return output_path
     except Exception as e:
         print(f"Error removing silence: {e}")
@@ -201,8 +205,9 @@ def stitch_chunk_files(chunk_files,output_filename):
         except Exception as e:
             print(f"Error appending chunk {f}: {e}")
 
-    # output_filename = f"final_output_{os.getpid()}.wav"
-    combined_audio.export(output_filename, format="wav")
+    out_ext = os.path.splitext(output_filename)[1].lower().lstrip(".")
+    out_format = out_ext if out_ext in ("wav", "mp3") else "wav"
+    combined_audio.export(output_filename, format=out_format)
     
     # Clean up temp files
     for f in chunk_files:
@@ -334,6 +339,7 @@ def generate_from_json(
     default_speaker="Ryan",
     default_instruct="Fale em portugues com um tom divertido, brincalhao e bem humorado.",
     model_size="1.7B",
+    output_format="mp3",
     remove_silence=False,
     make_subs=False,
 ):
@@ -342,7 +348,7 @@ def generate_from_json(
 
     Supported item formats:
     - "Some text"
-    - {"text": "Some text", "filename": "name.wav", "speaker": "Ryan", "language": "Portuguese", "instruct": "..."}
+    - {"text": "Some text", "filename": "name.mp3", "speaker": "Ryan", "language": "Portuguese", "instruct": "..."}
     """
     if not os.path.exists(audio_json_path):
         raise FileNotFoundError(f"JSON file not found: {audio_json_path}")
@@ -352,6 +358,10 @@ def generate_from_json(
 
     if not isinstance(payload, list):
         raise ValueError("audio.json must contain a JSON array.")
+
+    output_format = (output_format or "mp3").lower().strip()
+    if output_format not in ("wav", "mp3"):
+        raise ValueError("output_format must be either 'wav' or 'mp3'.")
 
     if not torch.cuda.is_available() and model_size == "1.7B":
         print("⚠️ CPU runtime detected. Switching model size from 1.7B to 0.6B for better stability.")
@@ -366,13 +376,13 @@ def generate_from_json(
             language = default_language
             speaker = default_speaker
             instruct = default_instruct
-            filename = f"audio_{idx:03d}.wav"
+            filename = f"audio_{idx:03d}.{output_format}"
         elif isinstance(item, dict):
             text = str(item.get("text", "")).strip()
             language = item.get("language", default_language)
             speaker = item.get("speaker", default_speaker)
             instruct = item.get("instruct", default_instruct)
-            filename = item.get("filename") or f"audio_{idx:03d}.wav"
+            filename = item.get("filename") or f"audio_{idx:03d}.{output_format}"
         else:
             print(f"[skip] Item {idx}: unsupported type {type(item).__name__}")
             continue
@@ -381,11 +391,15 @@ def generate_from_json(
             print(f"[skip] Item {idx}: empty text")
             continue
 
-        if not str(filename).lower().endswith(".wav"):
-            filename = f"{filename}.wav"
+        filename = str(filename)
+        base_name, ext = os.path.splitext(filename)
+        ext = ext.lower().lstrip(".")
+        if ext not in ("wav", "mp3"):
+            base_name = filename
+            ext = output_format
 
-        safe_base = _safe_name(os.path.splitext(str(filename))[0], f"audio_{idx:03d}")
-        out_path = os.path.join(output_dir, f"{safe_base}.wav")
+        safe_base = _safe_name(base_name, f"audio_{idx:03d}")
+        out_path = os.path.join(output_dir, f"{safe_base}.{ext}")
 
         print(f"[{idx}/{len(payload)}] Generating: {out_path}")
         stitched_file = _generate_custom_voice_file(
@@ -397,7 +411,7 @@ def generate_from_json(
             output_filename=out_path,
         )
 
-        final_audio, _, _, _, _, _ = process_audio_output(
+        final_audio, _, _, _, _ = process_audio_output(
             stitched_file,
             make_subtitle=make_subs,
             remove_silence=remove_silence,
@@ -466,7 +480,7 @@ def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model
 import click
 @click.command()
 @click.option("--audio-json", default=None, help="Path to JSON file for batch TTS generation.")
-@click.option("--output-dir", default="./generated_audio_json", show_default=True, help="Folder for generated WAV files.")
+@click.option("--output-dir", default="./generated_audio_json", show_default=True, help="Folder for generated audio files.")
 @click.option("--language", default="Portuguese", show_default=True, help="Default language when an item in audio.json does not provide one.")
 @click.option("--speaker", default="Ryan", show_default=True, help="Default speaker when an item in audio.json does not provide one.")
 @click.option(
@@ -476,6 +490,7 @@ import click
     help="Default speaking style when an item in audio.json does not provide one.",
 )
 @click.option("--model-size", default="1.7B", type=click.Choice(MODEL_SIZES), show_default=True, help="Model size for batch generation.")
+@click.option("--output-format", default="mp3", type=click.Choice(["wav", "mp3"]), show_default=True, help="Default output format when filename has no supported extension.")
 @click.option("--remove-silence", is_flag=True, default=False, help="Remove silence in output files.")
 @click.option("--make-subs", is_flag=True, default=False, help="Generate subtitles for output files.")
 def main(
@@ -485,6 +500,7 @@ def main(
     speaker,
     instruct,
     model_size,
+    output_format,
     remove_silence,
     make_subs,
 ):
@@ -498,6 +514,7 @@ def main(
         default_speaker=speaker,
         default_instruct=instruct,
         model_size=model_size,
+        output_format=output_format,
         remove_silence=remove_silence,
         make_subs=make_subs,
     )
