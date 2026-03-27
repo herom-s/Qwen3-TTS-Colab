@@ -64,10 +64,17 @@ def get_model(model_type: str, model_size: str):
     
     clear_other_models(keep_key=key)
     model_path = get_model_path(model_type, model_size)
+    use_cuda = torch.cuda.is_available()
+    device_map = "cuda" if use_cuda else "cpu"
+    dtype = torch.bfloat16 if use_cuda else torch.float32
+
+    if not use_cuda:
+        print("⚠️ CUDA is not available. Falling back to CPU mode (this will be much slower).")
+
     model = Qwen3TTSModel.from_pretrained(
         model_path,
-        device_map="cuda",
-        dtype=torch.bfloat16,
+        device_map=device_map,
+        dtype=dtype,
     )
     loaded_models[key] = model
     return model
@@ -345,6 +352,10 @@ def generate_from_json(
 
     if not isinstance(payload, list):
         raise ValueError("audio.json must contain a JSON array.")
+
+    if not torch.cuda.is_available() and model_size == "1.7B":
+        print("⚠️ CPU runtime detected. Switching model size from 1.7B to 0.6B for better stability.")
+        model_size = "0.6B"
 
     os.makedirs(output_dir, exist_ok=True)
     generated_files = []
