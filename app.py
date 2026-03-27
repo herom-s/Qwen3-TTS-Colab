@@ -456,39 +456,39 @@ import click
 @click.command()
 @click.option("--audio-json", default=None, help="Path to JSON file for batch TTS generation.")
 @click.option("--output-dir", default="./generated_audio_json", show_default=True, help="Folder for generated WAV files.")
-@click.option("--json-language", default="Portuguese", show_default=True, help="Default language for JSON batch mode.")
-@click.option("--json-speaker", default="Ryan", show_default=True, help="Default speaker for JSON batch mode.")
+@click.option("--language", default="Portuguese", show_default=True, help="Default language when an item in audio.json does not provide one.")
+@click.option("--speaker", default="Ryan", show_default=True, help="Default speaker when an item in audio.json does not provide one.")
 @click.option(
-    "--json-instruct",
+    "--instruct",
     default="Fale em portugues com um tom divertido, brincalhao e bem humorado.",
     show_default=True,
-    help="Default speaking style for JSON batch mode.",
+    help="Default speaking style when an item in audio.json does not provide one.",
 )
-@click.option("--json-model-size", default="1.7B", type=click.Choice(MODEL_SIZES), show_default=True, help="Model size for JSON batch mode.")
-@click.option("--json-remove-silence", is_flag=True, default=False, help="Remove silence in JSON batch output.")
-@click.option("--json-make-subs", is_flag=True, default=False, help="Generate subtitles for JSON batch output.")
+@click.option("--model-size", default="1.7B", type=click.Choice(MODEL_SIZES), show_default=True, help="Model size for batch generation.")
+@click.option("--remove-silence", is_flag=True, default=False, help="Remove silence in output files.")
+@click.option("--make-subs", is_flag=True, default=False, help="Generate subtitles for output files.")
 def main(
     audio_json,
     output_dir,
-    json_language,
-    json_speaker,
-    json_instruct,
-    json_model_size,
-    json_remove_silence,
-    json_make_subs,
+    language,
+    speaker,
+    instruct,
+    model_size,
+    remove_silence,
+    make_subs,
 ):
     if not audio_json:
-        raise click.UsageError("Please provide --audio-json <path>. Gradio UI mode was removed.")
+        raise click.UsageError("Please provide --audio-json <path> to generate audio from a JSON file.")
 
     generated = generate_from_json(
         audio_json_path=audio_json,
         output_dir=output_dir,
-        default_language=json_language,
-        default_speaker=json_speaker,
-        default_instruct=json_instruct,
-        model_size=json_model_size,
-        remove_silence=json_remove_silence,
-        make_subs=json_make_subs,
+        default_language=language,
+        default_speaker=speaker,
+        default_instruct=instruct,
+        model_size=model_size,
+        remove_silence=remove_silence,
+        make_subs=make_subs,
     )
     print(f"Done. Generated {len(generated)} audio file(s) in: {output_dir}")
 
