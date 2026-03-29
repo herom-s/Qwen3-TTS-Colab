@@ -389,6 +389,62 @@ def _generate_voice_design_file(text, language, voice_description, output_filena
     return stitch_chunk_files(chunk_files, output_filename)
 
 
+def _generate_voice_clone_file(
+    text,
+    language,
+    ref_audio,
+    ref_text,
+    clone_mode,
+    model_size,
+    output_filename,
+):
+    """Generate one VoiceClone TTS file and save it directly to output_filename."""
+    if not ref_audio or not str(ref_audio).strip():
+        raise ValueError("ref_audio is required for voice_clone mode.")
+
+    if not os.path.exists(ref_audio):
+        raise FileNotFoundError(f"Reference audio not found: {ref_audio}")
+
+    mode = (clone_mode or "fast").strip().lower()
+    if mode not in ("fast", "high_quality"):
+        raise ValueError("clone_mode must be either 'fast' or 'high_quality'.")
+
+    use_xvector_only = mode == "fast"
+    final_ref_text = ref_text
+    audio_tuple = _audio_to_tuple(ref_audio)
+    if audio_tuple is None:
+        raise ValueError(f"Could not load reference audio: {ref_audio}")
+
+    if not use_xvector_only and (not final_ref_text or not str(final_ref_text).strip()):
+        print("Auto-transcribing reference for high_quality cloning...")
+        final_ref_text = transcribe_reference(ref_audio, True, language)
+        if not final_ref_text or "Error" in final_ref_text:
+            raise RuntimeError(f"Transcription failed: {final_ref_text}")
+
+    text_chunks, _ = text_chunk(text, language, char_limit=280)
+    chunk_files = []
+    tts = get_model("Base", model_size)
+
+    for i, chunk in enumerate(text_chunks):
+        wavs, sr = tts.generate_voice_clone(
+            text=chunk.strip(),
+            language=language,
+            ref_audio=audio_tuple,
+            ref_text=final_ref_text.strip() if final_ref_text else None,
+            x_vector_only_mode=use_xvector_only,
+            max_new_tokens=2048,
+        )
+        temp_filename = f"temp_clone_batch_{i}_{os.getpid()}.wav"
+        sf.write(temp_filename, wavs[0], sr)
+        chunk_files.append(temp_filename)
+
+        del wavs
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    return stitch_chunk_files(chunk_files, output_filename)
+
+
 def generate_from_json(
     audio_json_path,
     output_dir="./generated_audio_json",
@@ -396,6 +452,9 @@ def generate_from_json(
     default_language="Portuguese",
     default_speaker="",
     default_instruct="Fale em portugues com um tom divertido, brincalhao e bem humorado.",
+    clone_ref_audio="",
+    clone_ref_text="",
+    clone_mode="fast",
     model_size="1.7B",
     output_format="mp3",
     remove_silence=False,
@@ -408,6 +467,7 @@ def generate_from_json(
     - "Some text"
     - {"text": "Some text", "filename": "name.mp3", "language": "Portuguese", "instruct": "..."}
     - For custom voice mode: include "speaker" (or use --speaker)
+    - For voice clone mode: include "ref_audio", optionally "ref_text" and "clone_mode"
     """
     if not os.path.exists(audio_json_path):
         raise FileNotFoundError(f"JSON file not found: {audio_json_path}")
@@ -423,12 +483,12 @@ def generate_from_json(
         raise ValueError("output_format must be either 'wav' or 'mp3'.")
 
     model_type = (model_type or "voice_design").strip().lower()
-    if model_type not in ("voice_design", "custom_voice"):
-        raise ValueError("model_type must be either 'voice_design' or 'custom_voice'.")
+    if model_type not in ("voice_design", "custom_voice", "voice_clone"):
+        raise ValueError("model_type must be one of: 'voice_design', 'custom_voice', 'voice_clone'.")
 
     if model_type == "voice_design":
         model_size = "1.7B"
-    elif not default_speaker or not str(default_speaker).strip():
+    elif model_type == "custom_voice" and (not default_speaker or not str(default_speaker).strip()):
         raise ValueError("default_speaker is required when model_type='custom_voice'.")
 
     if not torch.cuda.is_available() and model_size == "1.7B":
@@ -444,11 +504,17 @@ def generate_from_json(
             language = default_language
             instruct = default_instruct
             filename = f"audio_{idx:03d}.{output_format}"
+            ref_audio = clone_ref_audio
+            ref_text = clone_ref_text
+            item_clone_mode = clone_mode
         elif isinstance(item, dict):
             text = str(item.get("text", "")).strip()
             language = item.get("language", default_language)
             instruct = item.get("voice_description", item.get("instruct", default_instruct))
             filename = item.get("filename") or f"audio_{idx:03d}.{output_format}"
+            ref_audio = item.get("ref_audio", clone_ref_audio)
+            ref_text = item.get("ref_text", clone_ref_text)
+            item_clone_mode = item.get("clone_mode", clone_mode)
         else:
             print(f"[skip] Item {idx}: unsupported type {type(item).__name__}")
             continue
@@ -475,13 +541,23 @@ def generate_from_json(
                 voice_description=instruct,
                 output_filename=out_path,
             )
-        else:
+        elif model_type == "custom_voice":
             speaker = item.get("speaker", default_speaker) if isinstance(item, dict) else default_speaker
             stitched_file = _generate_custom_voice_file(
                 text=text,
                 language=language,
                 speaker=speaker,
                 instruct=instruct,
+                model_size=model_size,
+                output_filename=out_path,
+            )
+        else:
+            stitched_file = _generate_voice_clone_file(
+                text=text,
+                language=language,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                clone_mode=item_clone_mode,
                 model_size=model_size,
                 output_filename=out_path,
             )
@@ -556,7 +632,7 @@ import click
 @click.command()
 @click.option("--audio-json", default=None, help="Path to JSON file for batch TTS generation.")
 @click.option("--output-dir", default="./generated_audio", show_default=True, help="Folder for generated audio files.")
-@click.option("--model-type", default="voice_design", type=click.Choice(["voice_design", "custom_voice"]), show_default=True, help="Use 'voice_design' (no speaker required) or 'custom_voice' (speaker required).")
+@click.option("--model-type", default="voice_design", type=click.Choice(["voice_design", "custom_voice", "voice_clone"]), show_default=True, help="Use 'voice_design' (no speaker), 'custom_voice' (speaker), or 'voice_clone' (reference audio).")
 @click.option("--language", default="Portuguese", show_default=True, help="Default language when an item in audio.json does not provide one.")
 @click.option("--speaker", default="", show_default=True, help="Default speaker for custom_voice mode when an item in audio.json does not provide one.")
 @click.option(
@@ -565,6 +641,9 @@ import click
     show_default=True,
     help="Default speaking style when an item in audio.json does not provide one.",
 )
+@click.option("--clone-ref-audio", default="", show_default=True, help="Default reference audio path for voice_clone mode.")
+@click.option("--clone-ref-text", default="", show_default=True, help="Default transcript of the reference audio for voice_clone mode.")
+@click.option("--clone-mode", default="fast", type=click.Choice(["fast", "high_quality"]), show_default=True, help="Voice clone mode: fast (x-vector only) or high_quality (uses reference transcript).")
 @click.option("--model-size", default="1.7B", type=click.Choice(MODEL_SIZES), show_default=True, help="Model size for batch generation.")
 @click.option("--output-format", default="mp3", type=click.Choice(["wav", "mp3"]), show_default=True, help="Default output format when filename has no supported extension.")
 @click.option("--remove-silence", is_flag=True, default=False, help="Remove silence in output files.")
@@ -576,6 +655,9 @@ def main(
     language,
     speaker,
     instruct,
+    clone_ref_audio,
+    clone_ref_text,
+    clone_mode,
     model_size,
     output_format,
     remove_silence,
@@ -591,6 +673,9 @@ def main(
         default_language=language,
         default_speaker=speaker,
         default_instruct=instruct,
+        clone_ref_audio=clone_ref_audio,
+        clone_ref_text=clone_ref_text,
+        clone_mode=clone_mode,
         model_size=model_size,
         output_format=output_format,
         remove_silence=remove_silence,
