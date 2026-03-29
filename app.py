@@ -55,7 +55,7 @@ def clear_other_models(keep_key=None):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-def get_model(model_type: str, model_size: str):
+def get_model(model_type: str, model_size: str, allow_fallback: bool = True):
     """Load model and clear others to avoid OOM in Colab."""
     global loaded_models
     key = (model_type, model_size)
@@ -82,6 +82,11 @@ def get_model(model_type: str, model_size: str):
         print(f"✅ Using model: {model_type} {model_size}")
         return model
     except Exception as e:
+        if not allow_fallback:
+            raise RuntimeError(
+                f"Failed to load {model_type} {model_size} and fallback is disabled. {e}"
+            )
+
         # If 1.7B cannot be loaded (OOM or runtime limits), fall back to 0.6B.
         if model_size != "1.7B":
             raise
@@ -256,7 +261,8 @@ def generate_voice_design(text, language, voice_description, remove_silence, mak
         print(f"Processing {len(text_chunks)} chunks...")
         
         chunk_files = []
-        tts = get_model("VoiceDesign", "1.7B")
+        # Enforce true VoiceDesign 1.7B usage (no silent 0.6B fallback).
+        tts = get_model("VoiceDesign", "1.7B", allow_fallback=False)
 
         # 2. Generate & Save Loop
         for i, chunk in enumerate(text_chunks):
@@ -358,11 +364,37 @@ def _generate_custom_voice_file(text, language, speaker, instruct, model_size, o
     return stitch_chunk_files(chunk_files, output_filename)
 
 
+def _generate_voice_design_file(text, language, voice_description, output_filename):
+    """Generate one VoiceDesign TTS file and save it directly to output_filename."""
+    text_chunks, _ = text_chunk(text, language, char_limit=280)
+    chunk_files = []
+    tts = get_model("VoiceDesign", "1.7B", allow_fallback=False)
+
+    for i, chunk in enumerate(text_chunks):
+        wavs, sr = tts.generate_voice_design(
+            text=chunk.strip(),
+            language=language,
+            instruct=voice_description.strip(),
+            non_streaming_mode=True,
+            max_new_tokens=2048,
+        )
+        temp_filename = f"temp_vd_batch_{i}_{os.getpid()}.wav"
+        sf.write(temp_filename, wavs[0], sr)
+        chunk_files.append(temp_filename)
+
+        del wavs
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    return stitch_chunk_files(chunk_files, output_filename)
+
+
 def generate_from_json(
     audio_json_path,
     output_dir="./generated_audio_json",
+    model_type="voice_design",
     default_language="Portuguese",
-    default_speaker="Ryan",
+    default_speaker="",
     default_instruct="Fale em portugues com um tom divertido, brincalhao e bem humorado.",
     model_size="1.7B",
     output_format="mp3",
@@ -374,7 +406,8 @@ def generate_from_json(
 
     Supported item formats:
     - "Some text"
-    - {"text": "Some text", "filename": "name.mp3", "speaker": "Ryan", "language": "Portuguese", "instruct": "..."}
+    - {"text": "Some text", "filename": "name.mp3", "language": "Portuguese", "instruct": "..."}
+    - For custom voice mode: include "speaker" (or use --speaker)
     """
     if not os.path.exists(audio_json_path):
         raise FileNotFoundError(f"JSON file not found: {audio_json_path}")
@@ -389,6 +422,15 @@ def generate_from_json(
     if output_format not in ("wav", "mp3"):
         raise ValueError("output_format must be either 'wav' or 'mp3'.")
 
+    model_type = (model_type or "voice_design").strip().lower()
+    if model_type not in ("voice_design", "custom_voice"):
+        raise ValueError("model_type must be either 'voice_design' or 'custom_voice'.")
+
+    if model_type == "voice_design":
+        model_size = "1.7B"
+    elif not default_speaker or not str(default_speaker).strip():
+        raise ValueError("default_speaker is required when model_type='custom_voice'.")
+
     if not torch.cuda.is_available() and model_size == "1.7B":
         print("⚠️ CPU runtime detected. Switching model size from 1.7B to 0.6B for better stability.")
         model_size = "0.6B"
@@ -400,14 +442,12 @@ def generate_from_json(
         if isinstance(item, str):
             text = item.strip()
             language = default_language
-            speaker = default_speaker
             instruct = default_instruct
             filename = f"audio_{idx:03d}.{output_format}"
         elif isinstance(item, dict):
             text = str(item.get("text", "")).strip()
             language = item.get("language", default_language)
-            speaker = item.get("speaker", default_speaker)
-            instruct = item.get("instruct", default_instruct)
+            instruct = item.get("voice_description", item.get("instruct", default_instruct))
             filename = item.get("filename") or f"audio_{idx:03d}.{output_format}"
         else:
             print(f"[skip] Item {idx}: unsupported type {type(item).__name__}")
@@ -428,14 +468,23 @@ def generate_from_json(
         out_path = os.path.join(output_dir, f"{safe_base}.{ext}")
 
         print(f"[{idx}/{len(payload)}] Generating: {out_path}")
-        stitched_file = _generate_custom_voice_file(
-            text=text,
-            language=language,
-            speaker=speaker,
-            instruct=instruct,
-            model_size=model_size,
-            output_filename=out_path,
-        )
+        if model_type == "voice_design":
+            stitched_file = _generate_voice_design_file(
+                text=text,
+                language=language,
+                voice_description=instruct,
+                output_filename=out_path,
+            )
+        else:
+            speaker = item.get("speaker", default_speaker) if isinstance(item, dict) else default_speaker
+            stitched_file = _generate_custom_voice_file(
+                text=text,
+                language=language,
+                speaker=speaker,
+                instruct=instruct,
+                model_size=model_size,
+                output_filename=out_path,
+            )
 
         final_audio, _, _, _, _ = process_audio_output(
             stitched_file,
@@ -506,9 +555,10 @@ def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model
 import click
 @click.command()
 @click.option("--audio-json", default=None, help="Path to JSON file for batch TTS generation.")
-@click.option("--output-dir", default="./generated_audio_json", show_default=True, help="Folder for generated audio files.")
+@click.option("--output-dir", default="./generated_audio", show_default=True, help="Folder for generated audio files.")
+@click.option("--model-type", default="voice_design", type=click.Choice(["voice_design", "custom_voice"]), show_default=True, help="Use 'voice_design' (no speaker required) or 'custom_voice' (speaker required).")
 @click.option("--language", default="Portuguese", show_default=True, help="Default language when an item in audio.json does not provide one.")
-@click.option("--speaker", default="Ryan", show_default=True, help="Default speaker when an item in audio.json does not provide one.")
+@click.option("--speaker", default="", show_default=True, help="Default speaker for custom_voice mode when an item in audio.json does not provide one.")
 @click.option(
     "--instruct",
     default="Fale em portugues com um tom divertido, brincalhao e bem humorado.",
@@ -522,6 +572,7 @@ import click
 def main(
     audio_json,
     output_dir,
+    model_type,
     language,
     speaker,
     instruct,
@@ -536,6 +587,7 @@ def main(
     generated = generate_from_json(
         audio_json_path=audio_json,
         output_dir=output_dir,
+        model_type=model_type,
         default_language=language,
         default_speaker=speaker,
         default_instruct=instruct,
